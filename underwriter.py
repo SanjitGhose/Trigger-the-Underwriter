@@ -1,129 +1,125 @@
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
+import yfinance as yf
 import pdfplumber
 import re
-import io
+import plotly.graph_objects as go
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="Trigger the Underwriter", page_icon="🎯", layout="wide")
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="Trigger Underwriter + Ticker", page_icon="📈", layout="wide")
 
+# Custom CSS for that "Banker's Terminal" look
 st.markdown("""
 <style>
-    .stApp { background-color: #000000; color: #FFFFFF; }
-    h1, h2, h3 { color: #00FFC2 !important; }
-    div[data-testid="stMetric"] { background-color: #0A0A0A; border: 1px solid #1A1A1A; border-left: 5px solid #00FFC2; padding: 20px; border-radius: 8px; }
+    .stApp { background-color: #0d1117; color: #c9d1d9; }
+    [data-testid="stMetricValue"] { color: #00ffc2 !important; }
+    .stTable { border: 1px solid #30363d; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- ROBUST PDF PARSER ---
-def parse_financials_from_pdf(file):
-    # CRITICAL: Reset file pointer for every read attempt
-    file.seek(0)
-    extracted_data = {}
-    
+# --- 1. LIVE STOCK TICKER FEATURE ---
+def render_stock_ticker(ticker_symbol):
     try:
-        with pdfplumber.open(file) as pdf:
-            text = ""
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-            
-            mapping = {
-                'Cash & Bank Balances': [r'Cash', r'Bank Balance'],
-                'Sundry Debtors (Receivables)': [r'Debtors', r'Receivables', r'Trade Receivables'],
-                'Inventory (Stock)': [r'Inventory', r'Stock'],
-                'Sundry Creditors (Trade)': [r'Creditors', r'Payables'],
-                'Other Current Liabilities': [r'Other Current Liab'],
-                'Short Term Bank Borrowings': [r'Short Term Borrowing', r'Working Capital Loan', r'CC Limit'],
-                'Long Term Loans': [r'Long Term', r'Secured Loan'],
-                'Tangible Net Worth': [r'Net Worth', r'Equity'],
-                'EBITDA': [r'EBITDA', r'Operating Profit'],
-                'Annual Turnover (Revenue)': [r'Turnover', r'Revenue', r'Sales'],
-                'Total Raw Material Purchases': [r'Purchases', r'Cost of Materials'],
-                'Interest & Finance Charges': [r'Interest', r'Finance Cost'],
-                'Import Content (%)': [r'Import']
-            }
+        ticker = yf.Ticker(ticker_symbol)
+        info = ticker.info
+        hist = ticker.history(period="1mo")
+        
+        # Display Header
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            st.subheader(f"📊 Market View: {info.get('longName', ticker_symbol)}")
+        with col2:
+            current_price = info.get('currentPrice', 0)
+            prev_close = info.get('previousClose', 1)
+            delta = ((current_price - prev_close) / prev_close) * 100
+            st.metric("Live Price", f"₹{current_price:,.2f}", f"{delta:+.2f}%")
 
-            for key, patterns in mapping.items():
-                for pattern in patterns:
-                    match = re.search(fr"{pattern}.*?([\d,]+\.?\d*)", text, re.IGNORECASE)
-                    if match:
-                        val = match.group(1).replace(',', '')
-                        extracted_data[key] = float(val)
-                        break
+        # Market Stats
+        m1, m2, m3 = st.columns(3)
+        m1.write(f"**Market Cap:** ₹{info.get('marketCap', 0):,}")
+        m2.write(f"**52W High:** ₹{info.get('fiftyTwoWeekHigh', 0)}")
+        m3.write(f"**P/E Ratio:** {info.get('trailingPE', 'N/A')}")
+
+        # Sparkline Chart
+        fig = go.Figure(data=[go.Scatter(x=hist.index, y=hist['Close'], line=dict(color='#00ffc2', width=2))])
+        fig.update_layout(height=150, margin=dict(l=0,r=0,t=0,b=0), xaxis_visible=False, yaxis_visible=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+        st.plotly_chart(fig, use_container_view=True)
+        
     except Exception as e:
-        st.error(f"PDF Analysis Error: {e}")
+        st.sidebar.error(f"Ticker Error: {e}")
 
-    # Ensure we return a dataframe with the EXACT expected column names
-    final_list = []
-    for key in mapping.keys():
-        final_list.append({'Financial_Item': key, 'Amount_INR': extracted_data.get(key, 0.0)})
-    
-    return pd.DataFrame(final_list)
-
-# --- UNDERWRITING LOGIC ---
-def calculate_limits(df):
-    def fetch(item):
-        try: return float(df.loc[df['Financial_Item'] == item, 'Amount_INR'].values[0])
-        except: return 0.0
-
-    ca = fetch('Cash & Bank Balances') + fetch('Sundry Debtors (Receivables)') + fetch('Inventory (Stock)')
-    ocl = fetch('Sundry Creditors (Trade)') + fetch('Other Current Liabilities')
-    ebitda = fetch('EBITDA')
-    total_debt = fetch('Short Term Bank Borrowings') + fetch('Long Term Loans')
-    revenue = fetch('Annual Turnover (Revenue)')
-    
-    wc_limit = max(0, (ca * 0.75) - ocl)
-    tl_headroom = max(0, (ebitda * 3.5) - total_debt)
-    
-    return {
-        "WC": wc_limit, "TL": tl_headroom, "CA": ca, "OCL": ocl, "EB": ebitda, "TD": total_debt, "REV": revenue
+# --- 2. ROBUST PDF PARSER (With Reset Logic) ---
+def parse_financials(file):
+    file.seek(0) # Critical: Reset pointer
+    extracted_data = {}
+    with pdfplumber.open(file) as pdf:
+        full_text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
+        
+    # Dictionary of standard credit items
+    mapping = {
+        'Cash & Bank Balances': r'(?:Cash|Bank Balance).*?([\d,]+\.?\d*)',
+        'Sundry Debtors (Receivables)': r'(?:Debtors|Receivables).*?([\d,]+\.?\d*)',
+        'Inventory (Stock)': r'(?:Inventory|Stock).*?([\d,]+\.?\d*)',
+        'Sundry Creditors (Trade)': r'(?:Creditors|Payables).*?([\d,]+\.?\d*)',
+        'EBITDA': r'EBITDA.*?([\d,]+\.?\d*)',
+        'Annual Turnover (Revenue)': r'(?:Turnover|Revenue).*?([\d,]+\.?\d*)'
     }
 
-# --- MAIN APP ---
-def main():
-    st.title("🎯 Trigger the Underwriter")
-    
-    with st.sidebar:
-        st.header("Upload Center")
-        mode = st.radio("Source", ["Demo", "CSV", "PDF"])
-        file = st.file_uploader("Upload File", type=["csv", "pdf"]) if mode != "Demo" else None
-
-    if mode == "Demo":
-        df = pd.DataFrame({
-            'Financial_Item': ['Cash & Bank Balances', 'Sundry Debtors (Receivables)', 'Inventory (Stock)', 'Sundry Creditors (Trade)', 'Other Current Liabilities', 'Short Term Bank Borrowings', 'Long Term Loans', 'EBITDA', 'Annual Turnover (Revenue)'],
-            'Amount_INR': [1200000, 2400000, 14000000, 6300000, 400000, 8500000, 1100000, 4900000, 78000000]
-        })
-    elif file:
-        if mode == "CSV":
-            df = pd.read_csv(file)
-            # Standardize columns to avoid KeyError
-            df.columns = ['Financial_Item', 'Amount_INR']
+    for key, pattern in mapping.items():
+        match = re.search(pattern, full_text, re.IGNORECASE)
+        if match:
+            extracted_data[key] = float(match.group(1).replace(',', ''))
         else:
-            df = parse_financials_from_pdf(file)
+            extracted_data[key] = 0.0
+
+    return pd.DataFrame(list(extracted_data.items()), columns=['Financial_Item', 'Amount_INR'])
+
+# --- 3. MAIN APP INTERFACE ---
+def main():
+    st.title("🎯 Underwriter Terminal")
+
+    # SIDEBAR
+    with st.sidebar:
+        st.header("1. Market Intelligence")
+        ticker_input = st.text_input("Enter NSE Ticker", value="NYKAA.NS")
+        render_stock_ticker(ticker_input)
+        
+        st.divider()
+        st.header("2. Credit Analysis")
+        input_type = st.radio("Data Source", ["PDF Upload", "Manual Demo"])
+        uploaded_file = st.file_uploader("Upload Audit PDF", type="pdf") if input_type == "PDF Upload" else None
+
+    # LOGIC SWITCH
+    if input_type == "Manual Demo":
+        df = pd.DataFrame({
+            'Financial_Item': ['Cash & Bank Balances', 'Sundry Debtors (Receivables)', 'Inventory (Stock)', 'Sundry Creditors (Trade)'],
+            'Amount_INR': [1249400000, 2466100000, 14175400000, 6348300000]
+        })
+    elif uploaded_file:
+        df = parse_financials(uploaded_file)
     else:
-        st.info("Awaiting Input...")
+        st.warning("Please upload a PDF or switch to Demo mode.")
         return
 
-    res = calculate_limits(df)
+    # CALCULATIONS
+    ca = df.loc[df['Financial_Item'].str.contains('Cash|Debtors|Inventory'), 'Amount_INR'].sum()
+    ocl = df.loc[df['Financial_Item'].str.contains('Creditors'), 'Amount_INR'].sum()
+    wc_gap = ca - ocl
+    mpbf_ii = (ca * 0.75) - ocl
 
-    # UI Metrics
-    m1, m2, m3 = st.columns(3)
-    m1.metric("WC Limit", f"₹{res['WC']:,.0f}")
-    m2.metric("Term Loan Capacity", f"₹{res['TL']:,.0f}")
-    m3.metric("Total Exposure", f"₹{res['WC'] + res['TL']:,.0f}")
+    # DASHBOARD
+    st.subheader("Financial Underwriting Summary")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Current Assets", f"₹{ca/1e7:,.2f} Cr")
+    c2.metric("Working Capital Gap", f"₹{wc_gap/1e7:,.2f} Cr")
+    c3.metric("Eligible Bank Limit", f"₹{mpbf_ii/1e7:,.2f} Cr")
 
-    # Audit Trail (The source of your KeyError)
-    st.subheader("Audit Trail")
-    if 'Amount_INR' in df.columns:
-        # Create a copy for display to avoid modifying original data
-        display_df = df.copy()
-        display_df['Amount_INR'] = display_df['Amount_INR'].map('₹{:,.2f}'.format)
-        st.table(display_df)
-    else:
-        st.error("Data structure mismatch. Please ensure CSV has 'Financial_Item' and 'Amount_INR' columns.")
+    st.divider()
+    st.write("### Data Audit Trail")
+    # Using fixed names to avoid the KeyError you experienced
+    display_df = df.copy()
+    display_df['Amount (Formatted)'] = display_df['Amount_INR'].map(lambda x: f"₹{x:,.2f}")
+    st.dataframe(display_df[['Financial_Item', 'Amount (Formatted)']], use_container_width=True)
 
 if __name__ == "__main__":
     main()
