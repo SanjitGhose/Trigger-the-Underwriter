@@ -4,7 +4,6 @@ import plotly.graph_objects as go
 import pdfplumber
 import re
 import yfinance as yf
-import io
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
@@ -35,33 +34,33 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- UTILITY: CLEAN NUMERICS ---
-def clean_val(val):
+# --- ROBUST DATA CLEANING ---
+def clean_numeric_value(val):
+    """Handles Indian currency formatting like ' ? 58,18,64,000.00 '"""
     if pd.isna(val): return 0.0
-    # Strip currency, commas, and percentage signs
-    clean = re.sub(r'[^\d.]', '', str(val).replace(',', ''))
+    # Strip everything except numbers and decimal point
+    clean = re.sub(r'[^\d.]', '', str(val))
     try: return float(clean)
     except: return 0.0
 
 # --- PDF PARSING ENGINE ---
 def parse_financials_from_pdf(file):
-    file.seek(0)
     extracted_data = {}
     with pdfplumber.open(file) as pdf:
         text = "\n".join([page.extract_text() for page in pdf.pages if page.extract_text()])
         
         mapping = {
             'Cash & Bank Balances': [r'Cash', r'Bank Balance'],
-            'Sundry Debtors (Receivables)': [r'Debtors', r'Receivables'],
-            'Inventory (Stock)': [r'Inventory', r'Stock'],
-            'Sundry Creditors (Trade)': [r'Creditors', r'Payables'],
+            'Sundry Debtors (Receivables)': [r'Debtors', r'Receivables', r'Trade Receivables'],
+            'Inventory (Stock)': [r'Inventory', r'Stock', r'Closing Stock'],
+            'Sundry Creditors (Trade)': [r'Creditors', r'Payables', r'Trade Payables'],
             'Other Current Liabilities': [r'Other Current Liab'],
-            'Short Term Bank Borrowings': [r'Short Term Borrowing', r'CC Limit'],
-            'Long Term Loans': [r'Long Term'],
-            'Tangible Net Worth': [r'Net Worth', r'Equity'],
+            'Short Term Bank Borrowings': [r'Short Term Borrowing', r'Working Capital Loan', r'CC Limit'],
+            'Long Term Loans': [r'Long Term', r'Secured Loan', r'Term Loan'],
+            'Tangible Net Worth': [r'Net Worth', r'Equity', r'Shareholders Funds'],
             'EBITDA': [r'EBITDA', r'Operating Profit'],
-            'Annual Turnover (Revenue)': [r'Turnover', r'Revenue'],
-            'Total Raw Material Purchases': [r'Purchases'],
+            'Annual Turnover (Revenue)': [r'Turnover', r'Revenue', r'Sales'],
+            'Total Raw Material Purchases': [r'Purchases', r'Cost of Materials'],
             'Interest & Finance Charges': [r'Interest', r'Finance Cost'],
             'Import Content (%)': [r'Import'],
             'Operating Cycle (Days)': [r'Cycle', r'Days']
@@ -69,18 +68,21 @@ def parse_financials_from_pdf(file):
 
         for key, patterns in mapping.items():
             for pattern in patterns:
+                # Look for number following the pattern
                 match = re.search(fr"{pattern}.*?([\d,]+\.?\d*)", text, re.IGNORECASE)
                 if match:
-                    extracted_data[key] = clean_val(match.group(1))
+                    extracted_data[key] = clean_numeric_value(match.group(1))
                     break
     
-    return pd.DataFrame([{'Financial_Item': k, 'Amount_INR': extracted_data.get(k, 0.0)} for k in mapping.keys()])
+    final_list = [{'Financial_Item': k, 'Amount_INR': extracted_data.get(k, 0.0)} for k in mapping.keys()]
+    return pd.DataFrame(final_list)
 
 # --- TICKER DATA FETCHER ---
 def fetch_financials_from_ticker(ticker_symbol):
     try:
         stock = yf.Ticker(ticker_symbol)
-        bs, is_, cf = stock.balance_sheet, stock.income_stmt, stock.cash_flow
+        bs = stock.balance_sheet
+        is_ = stock.income_stmt
         if bs.empty: return None, "No data found."
         
         latest_bs = bs.iloc[:, 0]
@@ -117,18 +119,25 @@ def fetch_financials_from_ticker(ticker_symbol):
 def calculate_limits(df):
     def fetch(item):
         try:
-            # Flexible matching to prevent IndexError
-            val = df.loc[df['Financial_Item'].str.contains(item, case=False, na=False), 'Amount_INR']
-            return float(val.iloc[0]) if not val.empty else 0.0
+            # Flexible matching to find row containing item name
+            mask = df.iloc[:, 0].astype(str).str.contains(item, case=False, na=False)
+            if not mask.any(): 
+                mask = df.iloc[:, 1].astype(str).str.contains(item, case=False, na=False)
+            
+            # Get the last numeric value in that row
+            row = df[mask].iloc[0]
+            for val in reversed(row):
+                num = clean_numeric_value(val)
+                if num != 0: return num
+            return 0.0
         except: return 0.0
 
-    # Variable Mapping
-    cash, debtors = fetch('Cash'), fetch('Debtors')
-    inventory, creditors = fetch('Inventory'), fetch('Creditors')
-    other_cl, revenue = fetch('Other Current Liab'), fetch('Turnover')
-    ebitda, st_debt = fetch('EBITDA'), fetch('Short Term')
-    lt_debt, purchases = fetch('Long Term'), fetch('Purchases')
-    interest = fetch('Interest')
+    # Logic Variables
+    cash, debtors, inventory = fetch('Cash'), fetch('Debtors'), fetch('Inventory')
+    creditors, other_cl = fetch('Creditors'), fetch('Other Current')
+    revenue, ebitda = fetch('Turnover'), fetch('EBITDA')
+    st_debt, lt_debt = fetch('Short Term'), fetch('Long Term')
+    purchases, interest = fetch('Purchases'), fetch('Interest')
 
     # Calculations
     ca = cash + debtors + inventory
@@ -148,51 +157,43 @@ def calculate_limits(df):
         "LC": lc_limit, "LC_BRK": f"(Imports / 12 months x 4 months lead time)",
         "BG": bg_limit, "BG_BRK": "(10% of Annual Turnover)",
         "BILL": bill_limit, "BILL_BRK": "(80% of Sundry Debtors)",
-        "DSCR": ebitda / (interest + (total_debt/5 + 1)) if ebitda > 0 else 0,
         "CA": ca, "OCL": ocl, "EB": ebitda, "TD": total_debt
     }
 
 # --- MAIN APP ---
 def main():
     st.markdown("<h1>🎯 Trigger the Underwriter</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='color:#666;'>Automated Credit Decisioning | PDF & CSV Intelligence</p>", unsafe_allow_html=True)
+    st.markdown("<p style='color:#666;'>Automated Credit Decisioning | Intelligent Extraction</p>", unsafe_allow_html=True)
     st.markdown("---")
 
-    company_info, df = None, None
+    df = None
+    company_info = None
 
     with st.sidebar:
         st.header("Financial Gateway")
         input_type = st.radio("Source", ["Demo Mode", "Stock Ticker", "Upload CSV", "Upload PDF"])
         
         if input_type == "Stock Ticker":
-            ticker = st.text_input("Ticker Symbol", placeholder="RELIANCE.NS").upper()
+            ticker = st.text_input("Ticker Symbol").upper()
             if ticker:
-                with st.spinner("Fetching..."):
-                    df, company_info = fetch_financials_from_ticker(ticker)
+                df, company_info = fetch_financials_from_ticker(ticker)
         elif input_type == "Demo Mode":
-            df = pd.DataFrame({'Financial_Item': ['Cash', 'Debtors', 'Inventory', 'Creditors', 'Other Current Liab', 'Short Term', 'Long Term', 'EBITDA', 'Turnover', 'Purchases', 'Interest', 'Import'],
+            df = pd.DataFrame({'Financial_Item': ['Cash', 'Debtors', 'Inventory', 'Creditors', 'Other Current', 'Short Term', 'Long Term', 'EBITDA', 'Turnover', 'Purchases', 'Interest', 'Import'],
                                'Amount_INR': [2e6, 6e6, 5e6, 3.5e6, 1e6, 2.5e6, 7e6, 6.5e6, 45e6, 28e6, 9e5, 45]})
         else:
             file = st.file_uploader(f"Upload {input_type}", type=["csv", "pdf"])
             if file:
                 if input_type == "Upload CSV":
-                    file.seek(0)
+                    # Fix for the ValueError: we read the CSV and let the fetch function find the data
                     df = pd.read_csv(file)
-                    df.columns = ['Financial_Item', 'Amount_INR'] # Force schema
-                    df['Amount_INR'] = df['Amount_INR'].apply(clean_val)
                 else:
                     df = parse_financials_from_pdf(file)
 
     if df is not None:
-        if company_info:
-            st.markdown(f"<div style='background:#0A0A0A; padding:20px; border-radius:10px; border-left:4px solid #00FFC2; margin-bottom:20px;'>"
-                        f"<h2 style='margin:0; color:#00FFC2;'>{company_info['name']}</h2>"
-                        f"<p style='color:#888;'>Sector: {company_info['sector']} | Currency: {company_info['currency']}</p></div>", unsafe_allow_html=True)
-
         res = calculate_limits(df)
         sym = "₹" if (not company_info or company_info['currency'] == 'INR') else "$"
 
-        # I. DASHBOARD
+        # Dashboard
         st.subheader("I. Credit Limit Structuring")
         c1, c2, c3 = st.columns(3)
         c1.metric("WC (OD/CC) Limit", f"{sym}{res['WC']:,.0f}")
@@ -204,9 +205,7 @@ def main():
         c5.metric("Bank Guarantee (BG)", f"{sym}{res['BG']:,.0f}")
         c6.metric("Total Credit Exposure", f"{sym}{(res['WC']+res['TL']+res['LC']+res['BG']):,.0f}")
 
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        # II. MATH PROOF
+        # Math Proof
         st.subheader("II. Mathematical Decision Trail")
         t1, t2, t3 = st.tabs(["Fund Based Logic", "Non-Fund Based Logic", "Audit Data"])
         
